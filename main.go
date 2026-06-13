@@ -67,13 +67,12 @@ func main() {
 
 	var recordedSamples []byte
 	var recordMu sync.Mutex
-	isStopping := false // 📌 新增：标记是否正在进入结束阶段
+	isStopping := false 
 	stopDone := make(chan struct{})
 
 	onCapture := func(pOutputSample, pInputSample []byte, frameCount uint32) {
 		if len(pInputSample) > 0 {
 			recordMu.Lock()
-			// 📌 即使按下回车，在主线程彻底调用 Stop 之前，依然允许缓冲数据写入，确保尾音完整
 			if !isStopping {
 				recordedSamples = append(recordedSamples, pInputSample...)
 			}
@@ -110,20 +109,21 @@ func main() {
 
 	select {
 	case <-stopChan:
-		fmt.Println("检测到回车，正在完美收尾最后音频（排空残留缓冲区）...")
+		fmt.Println("检测到回车，正在多录制 1.2 秒以补全说话尾音...")
 	case <-sigChan:
-		fmt.Println("检测到 Ctrl+C，正在完美收尾最后音频（排空残留缓冲区）...")
+		fmt.Println("检测到 Ctrl+C，正在多录制 1.2 秒以补全说话尾音...")
 	}
 
-	// 📌 核心修复 1：留出 350ms 时间让底层驱动把卡在队列里的最后几帧音频彻底回调给 onCapture
-	time.Sleep(350 * time.Millisecond)
+	// 📌 ✨ 核心修复：引入 1200ms 的生理及操作延迟缓冲保护期
+	// 允许程序在用户敲击按键后，继续保持采集状态，把没说完的词完整收纳进来
+	time.Sleep(1200 * time.Millisecond)
 
-	// 📌 核心修复 2：此时缓冲区已完全排空，锁定状态停止接收后续可能产生的新杂音
+	// 📌 此时确定说话和尾音都已结束，锁定状态不再写入新杂音
 	recordMu.Lock()
 	isStopping = true
 	recordMu.Unlock()
 
-	// 📌 核心修复 3：最后安全地切断硬件设备
+	// 📌 彻底关闭底层硬件流
 	if err := device.Stop(); err != nil {
 		fmt.Printf("停止设备失败: %v\n", err)
 	}
@@ -171,14 +171,12 @@ func main() {
 		intBuffer[i] = val
 	}
 
-	// 创建output目录
 	err = os.MkdirAll("output", 0755)
 	if err != nil {
 		fmt.Printf("创建output目录失败: %v\n", err)
 		return
 	}
 
-	// 生成带时间戳的文件名
 	timestamp := time.Now().Format("2006-01-02_150405")
 
 	switch formatChoice {
