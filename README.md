@@ -62,6 +62,11 @@ go run main.go
 - `saveAsWav()`: 将 PCM 数据封装为标准 RIFF/WAV 格式文件。
 - `saveAsFlacNew()`: 核心优化函数。将 16-bit 采样数据转换为 FLAC 帧（Frame），通过 `PredVerbatim` 模式实现快速无损压缩打包。
 
+## 打包
+```
+go build -o audio_go_v1.0.0 .
+```
+
 ## 📝 开源协议
 
 [MIT License](LICENSE)

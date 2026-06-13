@@ -3,4 +3,4 @@
 *.mp3
 *.ogg
 output
-audio_go
+audio_go*
