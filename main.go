@@ -245,9 +245,10 @@ func main() {
 
 	timestamp := time.Now().Format("2006-01-02_150405")
 	var saveErr error
+	outputFilename := ""
 	switch formatChoice {
 	case 1:
-		outputFilename := filepath.Join(outDir, fmt.Sprintf("output_%s.wav", timestamp))
+		outputFilename = filepath.Join(outDir, fmt.Sprintf("output_%s.wav", timestamp))
 		audioBuf := &audio.IntBuffer{
 			Format: &audio.Format{
 				NumChannels: channels,
@@ -263,7 +264,7 @@ func main() {
 			fmt.Printf("成功保存: %s\n转换耗时：%v\n", outputFilename, elapsed)
 		}
 	default:
-		outputFilename := filepath.Join(outDir, fmt.Sprintf("output_%s.flac", timestamp))
+		outputFilename = filepath.Join(outDir, fmt.Sprintf("output_%s.flac", timestamp))
 		start := time.Now()
 		saveErr = saveAsFlacNew(outputFilename, intBuffer, sampleRate, channels)
 		elapsed := time.Since(start)
@@ -289,6 +290,9 @@ func main() {
 	} else {
 		fmt.Println("保留临时分片文件")
 	}
+	// 绝对路径输出提示
+	absOutDir, _ := filepath.Abs(outputFilename)
+	fmt.Printf("所有输出文件保存目录绝对路径: %s\n", absOutDir)
 }
 
 func saveAsWav(filename string, buf *audio.IntBuffer) error {
