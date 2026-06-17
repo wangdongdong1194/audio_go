@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -19,7 +21,20 @@ import (
 	"github.com/mewkiz/flac/meta"
 )
 
+const (
+	sampleRate = 16000
+	channels   = 1
+	bitDepth   = 16
+	// 每 0.5 秒音频落地一次，控制内存占用
+	flushInterval = 500 * time.Millisecond
+)
+
 func main() {
+	// 目录初始化
+	outDir := "output"
+	tempDir := filepath.Join(outDir, ".temp")
+	_ = os.MkdirAll(tempDir, 0755)
+
 	ctx, err := malgo.InitContext(nil, malgo.ContextConfig{}, func(message string) {})
 	if err != nil {
 		fmt.Printf("初始化音频上下文失败: %v\n", err)
@@ -54,30 +69,63 @@ func main() {
 		selectedIndex = 0
 	}
 
-	sampleRate := uint32(16000)
-	channels := uint16(1)
-	format := malgo.FormatS16
-
 	deviceConfig := malgo.DefaultDeviceConfig(malgo.Capture)
 	deviceConfig.Capture.DeviceID = devices[selectedIndex].ID.Pointer()
-	deviceConfig.Capture.Format = format
-	deviceConfig.Capture.Channels = uint32(channels)
+	deviceConfig.Capture.Format = malgo.FormatS16
+	deviceConfig.Capture.Channels = channels
 	deviceConfig.SampleRate = sampleRate
 	deviceConfig.PerformanceProfile = malgo.LowLatency
 
-	var recordedSamples []byte
+	var memBuf []byte
 	var recordMu sync.Mutex
-	isStopping := false 
+	isStopping := false
 	stopDone := make(chan struct{})
+	segIdx := 0 // 分片序号
+
+	// 定时落地协程
+	flushTicker := time.NewTicker(flushInterval)
+	defer flushTicker.Stop()
+	flushStop := make(chan struct{})
+	go func() {
+		for {
+			select {
+			case <-flushTicker.C:
+				recordMu.Lock()
+				if len(memBuf) == 0 || isStopping {
+					recordMu.Unlock()
+					continue
+				}
+				// 拷贝当前缓存
+				copyBuf := make([]byte, len(memBuf))
+				copy(copyBuf, memBuf)
+				memBuf = memBuf[:0] // 清空内存
+				recordMu.Unlock()
+
+				// 写入临时分片 raw PCM
+				segFile := filepath.Join(tempDir, fmt.Sprintf("seg_%06d.raw", segIdx))
+				f, err := os.Create(segFile)
+				if err != nil {
+					fmt.Printf("写入分片失败 %v\n", err)
+					continue
+				}
+				_, _ = f.Write(copyBuf)
+				f.Close()
+				segIdx++
+			case <-flushStop:
+				return
+			}
+		}
+	}()
 
 	onCapture := func(pOutputSample, pInputSample []byte, frameCount uint32) {
-		if len(pInputSample) > 0 {
-			recordMu.Lock()
-			if !isStopping {
-				recordedSamples = append(recordedSamples, pInputSample...)
-			}
-			recordMu.Unlock()
+		if len(pInputSample) == 0 {
+			return
 		}
+		recordMu.Lock()
+		if !isStopping {
+			memBuf = append(memBuf, pInputSample...)
+		}
+		recordMu.Unlock()
 	}
 
 	captureCallbacks := malgo.DeviceCallbacks{
@@ -109,46 +157,74 @@ func main() {
 
 	select {
 	case <-stopChan:
-		fmt.Println("检测到回车，正在多录制 1.2 秒以补全说话尾音...")
+		fmt.Println("检测到回车，多录制 1.2 秒补全尾音...")
 	case <-sigChan:
-		fmt.Println("检测到 Ctrl+C，正在多录制 1.2 秒以补全说话尾音...")
+		fmt.Println("检测到 Ctrl+C，多录制 1.2 秒补全尾音...")
 	}
-
-	// 📌 ✨ 核心修复：引入 1200ms 的生理及操作延迟缓冲保护期
-	// 允许程序在用户敲击按键后，继续保持采集状态，把没说完的词完整收纳进来
 	time.Sleep(1200 * time.Millisecond)
 
-	// 📌 此时确定说话和尾音都已结束，锁定状态不再写入新杂音
+	// 标记停止，停止写入内存
 	recordMu.Lock()
 	isStopping = true
 	recordMu.Unlock()
+	close(flushStop) // 关闭定时落地协程
 
-	// 📌 彻底关闭底层硬件流
+	// 把内存剩余缓存落地最后一片
+	recordMu.Lock()
+	if len(memBuf) > 0 {
+		segFile := filepath.Join(tempDir, fmt.Sprintf("seg_%06d.raw", segIdx))
+		f, _ := os.Create(segFile)
+		_, _ = f.Write(memBuf)
+		f.Close()
+		segIdx++
+		memBuf = memBuf[:0]
+	}
+	recordMu.Unlock()
+
 	if err := device.Stop(); err != nil {
 		fmt.Printf("停止设备失败: %v\n", err)
 	}
 
-	fmt.Println("正在等待设备完全停止并处理最后音频...")
+	fmt.Println("等待硬件设备完全关闭...")
 	select {
 	case <-stopDone:
 		fmt.Println("设备停止回调完成")
 	case <-time.After(500 * time.Millisecond):
-		fmt.Println("停止回调超时，继续后续处理")
+		fmt.Println("停止回调超时，继续合并分片")
 	}
 
-	fmt.Printf("录音已停止！共录制 %d 字节\n", len(recordedSamples))
+	// ===================== 读取所有分片合并完整PCM =====================
+	files, err := filepath.Glob(filepath.Join(tempDir, "seg_*.raw"))
+	if err != nil {
+		fmt.Printf("读取临时分片失败: %v\n", err)
+		return
+	}
+	if len(files) == 0 {
+		fmt.Println("无录音分片，程序退出")
+		return
+	}
+	// 按文件名序号升序排序
+	sort.Strings(files)
 
-	recordMu.Lock()
-	recordedLen := len(recordedSamples)
-	recordMu.Unlock()
-	if recordedLen < 2 {
-		fmt.Println("未录制到有效音频数据，程序退出")
+	var fullPCM []byte
+	for _, fp := range files {
+		data, err := os.ReadFile(fp)
+		if err != nil {
+			fmt.Printf("读取分片 %s 失败 %v\n", fp, err)
+			continue
+		}
+		fullPCM = append(fullPCM, data...)
+	}
+	fmt.Printf("录音已停止！合并后总音频字节: %d\n", len(fullPCM))
+	if len(fullPCM) < 2 {
+		fmt.Println("无有效音频数据")
 		return
 	}
 
+	// 格式选择
 	fmt.Println("\n=== 请选择要保存的音频格式 ===")
-	fmt.Println("0 WAV 格式 (体积较大，无损，任何设备都能播)")
-	fmt.Println("1 FLAC 格式 (体积小一半，无损，新版主流播放器通用)")
+	fmt.Println("0 FLAC 格式 (体积比 WAV 小一半，无损，新版主流播放器通用)")
+	fmt.Println("1 WAV 格式 (体积较大，无损，任何设备都能播)")
 	fmt.Print("请输入选项 (0 或 1): ")
 
 	text, _ := reader.ReadString('\n')
@@ -158,58 +234,60 @@ func main() {
 		formatChoice = 0
 	}
 
-	recordMu.Lock()
-	temp := make([]byte, len(recordedSamples))
-	copy(temp, recordedSamples)
-	recordMu.Unlock()
-
-	numSamples := len(temp) / 2
+	// PCM字节转int样本
+	numSamples := len(fullPCM) / 2
 	intBuffer := make([]int, numSamples)
 	for i := 0; i < numSamples; i++ {
-		raw := binary.LittleEndian.Uint16(temp[i*2 : i*2+2])
+		raw := binary.LittleEndian.Uint16(fullPCM[i*2 : i*2+2])
 		val := int(int16(raw))
 		intBuffer[i] = val
 	}
 
-	err = os.MkdirAll("output", 0755)
-	if err != nil {
-		fmt.Printf("创建output目录失败: %v\n", err)
-		return
-	}
-
 	timestamp := time.Now().Format("2006-01-02_150405")
-
+	var saveErr error
 	switch formatChoice {
 	case 1:
-		outputFilename := fmt.Sprintf("output/output_%s.flac", timestamp)
-		start := time.Now()
-		err = saveAsFlacNew(outputFilename, intBuffer, sampleRate, channels)
-		elapsed := time.Since(start)
-		if err == nil {
-			fmt.Printf("成功！已保存为新版无损压缩文件: %s\n", outputFilename)
-			fmt.Printf("FLAC 转换耗时：%v\n", elapsed)
-		}
-	default:
-		outputFilename := fmt.Sprintf("output/output_%s.wav", timestamp)
+		outputFilename := filepath.Join(outDir, fmt.Sprintf("output_%s.wav", timestamp))
 		audioBuf := &audio.IntBuffer{
 			Format: &audio.Format{
-				NumChannels: int(channels),
+				NumChannels: channels,
 				SampleRate:  int(sampleRate),
 			},
 			Data:           intBuffer,
-			SourceBitDepth: 16,
+			SourceBitDepth: bitDepth,
 		}
 		start := time.Now()
-		err = saveAsWav(outputFilename, audioBuf)
+		saveErr = saveAsWav(outputFilename, audioBuf)
 		elapsed := time.Since(start)
-		if err == nil {
-			fmt.Printf("成功！已保存为标准无损文件: %s\n", outputFilename)
-			fmt.Printf("WAV 转换耗时：%v\n", elapsed)
+		if saveErr == nil {
+			fmt.Printf("成功保存: %s\n转换耗时：%v\n", outputFilename, elapsed)
+		}
+	default:
+		outputFilename := filepath.Join(outDir, fmt.Sprintf("output_%s.flac", timestamp))
+		start := time.Now()
+		saveErr = saveAsFlacNew(outputFilename, intBuffer, sampleRate, channels)
+		elapsed := time.Since(start)
+		if saveErr == nil {
+			fmt.Printf("成功保存: %s\n转换耗时：%v\n", outputFilename, elapsed)
 		}
 	}
 
-	if err != nil {
-		fmt.Printf("文件保存失败: %v\n", err)
+	if saveErr != nil {
+		fmt.Printf("文件保存失败: %v\n", saveErr)
+	}
+	// 询问是否清理临时分片
+	fmt.Print("是否清理临时分片文件？(y/n): ")
+	choice, _ := reader.ReadString('\n')
+	choice = strings.TrimSpace(strings.ToLower(choice))
+	if choice == "y" || choice == "yes" {
+		for _, f := range files {
+			_ = os.Remove(f)
+		}
+		// 删除空的 temp 目录
+		_ = os.Remove(tempDir)
+		fmt.Println("已清理临时分片文件")
+	} else {
+		fmt.Println("保留临时分片文件")
 	}
 }
 
