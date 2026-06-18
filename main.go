@@ -29,9 +29,27 @@ const (
 	flushInterval = 500 * time.Millisecond
 )
 
+// 获取程序exe所在目录，解决双击运行路径错乱问题
+func getExeDir() string {
+	exePath, err := os.Executable()
+	if err != nil {
+		wd, _ := os.Getwd()
+		return wd
+	}
+
+	exeDir := filepath.Dir(exePath)
+	// 判断是否是go run临时构建目录：路径包含 /T/go-build
+	if strings.Contains(exeDir, "/T/go-build") {
+		wd, _ := os.Getwd()
+		return wd
+	}
+	return exeDir
+}
+
 func main() {
-	// 目录初始化
-	outDir := "output"
+	// 固定输出目录为exe同目录下的output，双击运行不会跑偏
+	exeDir := getExeDir()
+	outDir := filepath.Join(exeDir, "output")
 	tempDir := filepath.Join(outDir, ".temp")
 	_ = os.MkdirAll(tempDir, 0755)
 
@@ -261,7 +279,7 @@ func main() {
 		saveErr = saveAsWav(outputFilename, audioBuf)
 		elapsed := time.Since(start)
 		if saveErr == nil {
-			fmt.Printf("成功保存: %s\n转换耗时：%v\n", outputFilename, elapsed)
+			fmt.Printf("成功保存相对路径: %s\n转换耗时：%v\n", outputFilename, elapsed)
 		}
 	default:
 		outputFilename = filepath.Join(outDir, fmt.Sprintf("output_%s.flac", timestamp))
@@ -269,7 +287,7 @@ func main() {
 		saveErr = saveAsFlacNew(outputFilename, intBuffer, sampleRate, channels)
 		elapsed := time.Since(start)
 		if saveErr == nil {
-			fmt.Printf("成功保存: %s\n转换耗时：%v\n", outputFilename, elapsed)
+			fmt.Printf("成功保存相对路径: %s\n转换耗时：%v\n", outputFilename, elapsed)
 		}
 	}
 
@@ -290,9 +308,12 @@ func main() {
 	} else {
 		fmt.Println("保留临时分片文件")
 	}
-	// 绝对路径输出提示
-	absOutDir, _ := filepath.Abs(outputFilename)
-	fmt.Printf("所有输出文件保存目录绝对路径: %s\n", absOutDir)
+
+	// 分开获取目录绝对路径、文件绝对路径
+	absOutputDir, _ := filepath.Abs(outDir)
+	absAudioFile, _ := filepath.Abs(outputFilename)
+	fmt.Printf("录音保存目录（绝对路径）：%s\n", absOutputDir)
+	fmt.Printf("录音文件完整绝对路径：%s\n", absAudioFile)
 }
 
 func saveAsWav(filename string, buf *audio.IntBuffer) error {
